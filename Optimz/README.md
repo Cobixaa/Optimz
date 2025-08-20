@@ -9,13 +9,12 @@ Command-line tool to optimize already-compiled C/C++ binaries on Linux and Termu
 - Detects ELF binaries; safely skips non-ELF files
 - Works on Linux x86_64 and Termux (aarch64/arm64)
 
-### Build
+### Build (no Makefile)
 ```bash
 cd Optimz
-make
+mkdir -p bin
+g++ -O2 -std=c++17 -Wall -Wextra -Wpedantic -o bin/Opt src/main.cpp
 ```
-
-The binary will be created at `bin/Opt`.
 
 ### Usage
 ```bash
@@ -28,19 +27,30 @@ The binary will be created at `bin/Opt`.
 
 - The `-<times>` argument specifies how many optimization passes to run (default: 1 if omitted).
 - The tool makes a one-time backup next to the target as `<program_path>.bak` on the first run.
+ - Steps attempted each pass (skipping unavailable tools):
+   - Strip unneeded and all symbols (`llvm-strip`/`strip`)
+   - Remove debug info and metadata sections; compress debug sections (`llvm-objcopy`/`objcopy`)
+   - Shrink RPATH (`patchelf`)
+   - Aggressive super-strip if available (`sstrip`)
+   - Final packing (`upx --best --lzma`)
 
 ### Termux notes
-- Ensure the `clang`, `make`, and `binutils`/`llvm` packages are installed:
+- Ensure the `clang` and `binutils`/`llvm` packages are installed:
 ```bash
-pkg install clang make
+pkg install clang
 # Optional tools the optimizer can use if present
-pkg install binutils upx
+pkg install binutils upx patchelf
 ```
 
 ### Test locally
 Build the tool and a sample program, then optimize it:
 ```bash
-make samples
+# build Optimz (see Build section above)
+
+# build sample
+cc -O2 -Wall -Wextra -pipe -o samples/hello samples/hello.c
+
+# run optimizer
 ./bin/Opt samples/hello -2
 ```
 

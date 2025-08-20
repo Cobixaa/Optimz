@@ -1,5 +1,6 @@
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <cerrno>
@@ -78,6 +79,8 @@ struct Tools {
 	std::optional<std::string> strip;
 	std::optional<std::string> objcopy;
 	std::optional<std::string> upx;
+	std::optional<std::string> patchelf;
+	std::optional<std::string> sstrip;
 };
 
 static Tools detectTools() {
@@ -90,6 +93,9 @@ static Tools detectTools() {
 	if (!t.objcopy) t.objcopy = which("objcopy");
 	// upx is optional
 	t.upx = which("upx");
+	// patchelf and sstrip are optional
+	t.patchelf = which("patchelf");
+	t.sstrip = which("sstrip");
 	return t;
 }
 
@@ -107,34 +113,56 @@ static bool backupOnce(const fs::path &target) {
 }
 
 static bool optimizeOnce(const fs::path &target, const Tools &tools) {
-	bool changed = false;
+	bool anyShrank = false;
+	std::uintmax_t sizeNow = fileSize(target);
+	std::uintmax_t beforeStep = 0;
 
-	std::uintmax_t sizeBefore = fileSize(target);
+	auto tryStep = [&](const std::vector<std::string> &cmd) {
+		beforeStep = sizeNow;
+		int rc = runCommand(cmd, true);
+		sizeNow = fileSize(target);
+		if (rc == 0 && sizeNow < beforeStep) {
+			anyShrank = true;
+		}
+	};
 
+	// 1) Strip symbols (unneeded first, then all)
 	if (tools.strip) {
-		int rc = runCommand({*tools.strip, "--strip-unneeded", target.string()}, true);
-		if (rc == 0) changed = true;
+		tryStep({*tools.strip, "--strip-unneeded", target.string()});
+		tryStep({*tools.strip, "--strip-all", target.string()});
 	}
 
+	// 2) Remove debug info and common note/comment sections
 	if (tools.objcopy) {
-		// Compress debug sections if present; ignore errors
-		int rc = runCommand({*tools.objcopy, "--compress-debug-sections", target.string()}, true);
-		if (rc == 0) changed = true;
+		tryStep({*tools.objcopy, "--strip-debug", target.string()});
+		// Remove non-essential metadata sections
+		tryStep({*tools.objcopy, "--remove-section=.comment", "--remove-section=.note", "--remove-section=.note.*", "--remove-section=.gnu_debuglink", target.string()});
+		// Compress whatever debug sections may remain
+		tryStep({*tools.objcopy, "--compress-debug-sections", target.string()});
 	}
 
+	// 3) Shrink RPATH if present
+	if (tools.patchelf) {
+		tryStep({*tools.patchelf, "--shrink-rpath", target.string()});
+	}
+
+	// 4) Super-strip (more aggressive)
+	if (tools.sstrip) {
+		tryStep({*tools.sstrip, target.string()});
+	}
+
+	// 5) Pack with UPX as final step
 	if (tools.upx) {
-		// Try --best --lzma; if it fails, skip
-		int rc = runCommand({*tools.upx, "--best", "--lzma", target.string()}, true);
-		if (rc == 0) changed = true;
+		tryStep({*tools.upx, "--best", "--lzma", target.string()});
 	}
 
-	std::uintmax_t sizeAfter = fileSize(target);
-	std::cerr << "Size: " << sizeBefore << " -> " << sizeAfter << " bytes\n";
-	return changed && sizeAfter <= sizeBefore;
+	std::cerr << "Size: " << (fileSize(target) + 0) << " bytes\n";
+	return anyShrank;
 }
 
 static void usage(const char *argv0) {
 	std::cerr << "Usage: " << argv0 << " <program_path> -<times>\n";
+	std::cerr << "\tPerforms multiple optimization passes over an ELF binary.\n";
 	std::cerr << "\t<times> defaults to 1 if omitted. Example: " << argv0 << " ./a.out -2\n";
 }
 
@@ -185,8 +213,8 @@ int main(int argc, char **argv) {
 
 	for (int i = 1; i <= passes; ++i) {
 		std::cerr << "Pass " << i << "/" << passes << "\n";
-		bool ok = optimizeOnce(target, tools);
-		if (!ok) {
+		bool shrank = optimizeOnce(target, tools);
+		if (!shrank) {
 			std::cerr << "No further changes; stopping early.\n";
 			break;
 		}
